@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Response, Cookie
+from fastapi.responses import RedirectResponse
 from sqlmodel import Session, select
 from starlette import status
 from database import get_session
@@ -196,113 +197,203 @@ async def refresh_access_token(
     
     return {"access_token": new_access_token, "token_type": "bearer"}
 
-# --- Google OAuth (Commented out) ---
-# @auth.get("/google/login")
-# async def google_login():
-#     return {
-#         "url": f"https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id={settings.GOOGLE_CLIENT_ID}&redirect_uri={settings.GOOGLE_REDIRECT_URI}&scope=openid%20email%20profile"
-#     }
+# --- Helper: set auth cookies and redirect to frontend ---
+def _build_oauth_redirect(user, response_class=RedirectResponse):
+    """Create a redirect response with auth cookies set."""
+    access_token = create_access_token(data={"sub": user.email, "id": user.id})
+    refresh_token = create_refresh_token(data={"sub": user.email, "id": user.id})
 
-# @auth.get("/google/callback")
-# async def google_callback(code: str, session: Session = Depends(get_session)):
-#     # Exchange code for token
-#     token_url = "https://oauth2.googleapis.com/token"
-#     data = {
-#         "code": code,
-#         "client_id": settings.GOOGLE_CLIENT_ID,
-#         "client_secret": settings.GOOGLE_CLIENT_SECRET,
-#         "redirect_uri": settings.GOOGLE_REDIRECT_URI,
-#         "grant_type": "authorization_code",
-#     }
-#     
-#     async with httpx.AsyncClient() as client:
-#         response = await client.post(token_url, data=data)
-#         token_data = response.json()
-#         
-#     access_token = token_data.get("access_token")
-#     if not access_token:
-#         raise HTTPException(status_code=400, detail="Failed to get google token")
-#         
-#     # Get user info
-#     user_info_url = "https://www.googleapis.com/oauth2/v3/userinfo"
-#     async with httpx.AsyncClient() as client:
-#         user_info_res = await client.get(user_info_url, headers={"Authorization": f"Bearer {access_token}"})
-#         user_info = user_info_res.json()
-#         
-#     email = user_info.get("email")
-#     google_id = user_info.get("sub")
-#     full_name = user_info.get("name")
-#     
-#     # Find or create user
-#     user = session.exec(select(User).where(User.email == email)).first()
-#     if not user:
-#         user = User(email=email, google_id=google_id, full_name=full_name)
-#         session.add(user)
-#     else:
-#         user.google_id = google_id
-#         session.add(user)
-#         
-#     session.commit()
-#     session.refresh(user)
-#     
-#     # Generate our JWT
-#     token = create_access_token(data={"sub": user.email, "id": user.id})
-#     return {"access_token": token, "token_type": "bearer"}
+    redirect = response_class(url=settings.FRONTEND_URL, status_code=302)
+    redirect.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        max_age=1800,
+        expires=1800,
+        path="/",
+        samesite="lax",
+        secure=True,
+    )
+    redirect.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        max_age=10080 * 60,
+        expires=10080 * 60,
+        path="/",
+        samesite="lax",
+        secure=True,
+    )
+    return redirect
 
-# --- GitHub OAuth (Commented out) ---
-# @auth.get("/github/login")
-# async def github_login():
-#     return {
-#         "url": f"https://github.com/login/oauth/authorize?client_id={settings.GITHUB_CLIENT_ID}&redirect_uri={settings.GITHUB_REDIRECT_URI}&scope=user:email"
-#     }
 
-# @auth.get("/github/callback")
-# async def github_callback(code: str, session: Session = Depends(get_session)):
-#     # Exchange code for token
-#     token_url = "https://github.com/login/oauth/access_token"
-#     params = {
-#         "client_id": settings.GITHUB_CLIENT_ID,
-#         "client_secret": settings.GITHUB_CLIENT_SECRET,
-#         "code": code,
-#         "redirect_uri": settings.GITHUB_REDIRECT_URI
-#     }
-#     headers = {"Accept": "application/json"}
-#     
-#     async with httpx.AsyncClient() as client:
-#         response = await client.post(token_url, params=params, headers=headers)
-#         token_data = response.json()
-#         
-#     access_token = token_data.get("access_token")
-#     if not access_token:
-#         raise HTTPException(status_code=400, detail="Failed to get github token")
-#         
-#     # Get user info
-#     async with httpx.AsyncClient() as client:
-#         user_res = await client.get("https://api.github.com/user", headers={"Authorization": f"token {access_token}"})
-#         user_info = user_res.json()
-#         
-#         # GitHub might not return email in /user if it's private, we might need /user/emails
-#         email = user_info.get("email")
-#         if not email:
-#             emails_res = await client.get("https://api.github.com/user/emails", headers={"Authorization": f"token {access_token}"})
-#             emails = emails_res.json()
-#             email = next((e["email"] for e in emails if e["primary"]), emails[0]["email"])
-#             
-#     github_id = str(user_info.get("id"))
-#     full_name = user_info.get("name")
-#     
-#     # Find or create user
-#     user = session.exec(select(User).where(User.email == email)).first()
-#     if not user:
-#         user = User(email=email, github_id=github_id, full_name=full_name)
-#         session.add(user)
-#     else:
-#         user.github_id = github_id
-#         session.add(user)
-#         
-#     session.commit()
-#     session.refresh(user)
-#     
-#     # Generate our JWT
-#     token = create_access_token(data={"sub": user.email, "id": user.id})
-#     return {"access_token": token, "token_type": "bearer"}
+# --- Google OAuth ---
+@auth.get("/google/login")
+async def google_login():
+    # Build your URL string
+    google_url = (
+        f"https://accounts.google.com/o/oauth2/v2/auth"
+        f"?response_type=code"
+        f"&client_id={settings.GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={settings.GOOGLE_REDIRECT_URI}"
+        f"&scope=openid%20email%20profile"
+    )
+    
+    # Instead of returning a dict, return a RedirectResponse
+    return RedirectResponse(url=google_url)
+
+
+@auth.get("/google/callback")
+async def google_callback(code: str, session: Session = Depends(get_session)):
+    try:
+        # Exchange authorization code for tokens
+        token_url = "https://oauth2.googleapis.com/token"
+        data = {
+            "code": code,
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, data=data)
+            token_data = response.json()
+
+        google_access_token = token_data.get("access_token")
+        if not google_access_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to obtain Google access token",
+            )
+
+        # Fetch user profile from Google
+        async with httpx.AsyncClient() as client:
+            user_info_res = await client.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={"Authorization": f"Bearer {google_access_token}"},
+            )
+            user_info = user_info_res.json()
+
+        email = user_info.get("email")
+        google_id = user_info.get("sub")
+        full_name = user_info.get("name")
+
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Could not retrieve email from Google",
+            )
+
+        # Find or create user
+        user = session.exec(select(User).where(User.email == email)).first()
+        if not user:
+            user = User(email=email, google_id=google_id, full_name=full_name)
+            session.add(user)
+        else:
+            user.google_id = google_id
+            session.add(user)
+
+        session.commit()
+        session.refresh(user)
+
+        # Set cookies & redirect to frontend
+        return _build_oauth_redirect(user)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
+
+
+# --- GitHub OAuth ---
+@auth.get("/github/login")
+async def github_login():
+    return {
+        "url": (
+            f"https://github.com/login/oauth/authorize"
+            f"?client_id={settings.GITHUB_CLIENT_ID}"
+            f"&redirect_uri={settings.GITHUB_REDIRECT_URI}"
+            f"&scope=user:email"
+        )
+    }
+
+
+@auth.get("/github/callback")
+async def github_callback(code: str, session: Session = Depends(get_session)):
+    try:
+        # Exchange authorization code for token
+        token_url = "https://github.com/login/oauth/access_token"
+        params = {
+            "client_id": settings.GITHUB_CLIENT_ID,
+            "client_secret": settings.GITHUB_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": settings.GITHUB_REDIRECT_URI,
+        }
+        headers = {"Accept": "application/json"}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, params=params, headers=headers)
+            token_data = response.json()
+
+        github_access_token = token_data.get("access_token")
+        if not github_access_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to obtain GitHub access token",
+            )
+
+        # Fetch user profile from GitHub
+        async with httpx.AsyncClient() as client:
+            user_res = await client.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"token {github_access_token}"},
+            )
+            user_info = user_res.json()
+
+            # GitHub may not return email if it's set to private
+            email = user_info.get("email")
+            if not email:
+                emails_res = await client.get(
+                    "https://api.github.com/user/emails",
+                    headers={"Authorization": f"token {github_access_token}"},
+                )
+                emails = emails_res.json()
+                primary = next((e["email"] for e in emails if e.get("primary")), None)
+                email = primary or (emails[0]["email"] if emails else None)
+
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Could not retrieve email from GitHub",
+            )
+
+        github_id = str(user_info.get("id"))
+        full_name = user_info.get("name") or user_info.get("login")
+
+        # Find or create user
+        user = session.exec(select(User).where(User.email == email)).first()
+        if not user:
+            user = User(email=email, github_id=github_id, full_name=full_name)
+            session.add(user)
+        else:
+            user.github_id = github_id
+            session.add(user)
+
+        session.commit()
+        session.refresh(user)
+
+        # Set cookies & redirect to frontend
+        return _build_oauth_redirect(user)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
+
