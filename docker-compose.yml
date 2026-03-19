@@ -1,0 +1,31 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - /app/.venv
+      - /app/__pycache__
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      - db
+
+  # If they decide to move from SQLite to PostgreSQL later
+  db:
+     image: postgres:16-alpine
+     environment:
+       - POSTGRES_USER=admin
+       - POSTGRES_PASSWORD=password
+       - POSTGRES_DB=brainstorming
+     volumes:
+        - postgres_data:/var/lib/postgresql/data
+     ports:
+        - "5432:5432"
+
+volumes:
+  postgres_data:
