@@ -7,3 +7,8 @@ httpx
 fastapi-mail
 pydantic-settings
 bcrypt
+ollama
+langchain
+langchain-community
+langgraph
+langchain-ollama
