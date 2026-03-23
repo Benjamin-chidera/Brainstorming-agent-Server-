@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 from sqlmodel import SQLModel, Field, Relationship
 from datetime import datetime, timezone
 
@@ -12,6 +12,8 @@ class User(SQLModel, table=True):
     # Provider info for social auth
     google_id: Optional[str] = Field(default=None, index=True)
     github_id: Optional[str] = Field(default=None, index=True)
+    
+    agents: List["Agents"] = Relationship(back_populates="user")
 
 class OTP(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -21,3 +23,22 @@ class OTP(SQLModel, table=True):
     is_used: bool = Field(default=False)
     full_name: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class AgentsBase(SQLModel):
+    gender: str
+    bio: str
+    accent: str
+    avatarUrl: str
+    tone: str   
+    voice: str
+
+class AgentsCreate(AgentsBase):
+    pass
+
+class Agents(AgentsBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    user: Optional[User] = Relationship(back_populates="agents")
