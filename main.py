@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 # auth  
-from router import auth, agents 
+from router import auth, agents
+from sockets_manager import sio_app # Import our Socket.IO server
 
 from database import create_db_and_tables
 from contextlib import asynccontextmanager
@@ -27,10 +28,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount the socket.io app
+app.mount("/socket.io", sio_app)
+
 # Include the router with prefix and tags
 app.include_router(auth, prefix="/api/v1")
 app.include_router(agents.bio, prefix="/api/v1")
 app.include_router(agents.create_council, prefix="/api/v1") 
+app.include_router(agents.meeting, prefix="/api/v1")    
 
 @app.get("/")
 def read_root():

@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.13.1",
     "python-dotenv>=1.2.2",
     "python-jose[cryptography]>=3.5.0",
+    "python-socketio>=5.16.1",
     "sqlmodel>=0.0.37",
     "uvicorn[standard]>=0.41.0",
 ]
