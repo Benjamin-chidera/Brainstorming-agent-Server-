@@ -5,6 +5,7 @@ from models import User, Agents, Meeting, MeetingCreate
 from sqlmodel import select
 from utils.auth import get_current_user
 from starlette import status
+from agents import get_agents
 
 route = APIRouter(
     prefix="/agents",
@@ -23,11 +24,15 @@ def start_meeting(meeting_in: MeetingCreate, user: User = Depends(get_current_us
             
         # check if all agents exist
         agents_in_db = session.exec(select(Agents).where(Agents.id.in_(meeting_in.agentIds))).all()
+
         if len(agents_in_db) != len(meeting_in.agentIds):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="One or more agents not found"
-            )   
+            ) 
+
+# pass agent data to langgraph
+        get_agents(agents_in_db)  
 
         # check meeeting status
         if meeting_in.status not in ["active", "paused", "ended"]:
