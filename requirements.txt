@@ -12,4 +12,5 @@ langchain
 langchain-community
 langgraph
 langchain-ollama
+langchain-openai
 python-socketio

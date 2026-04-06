@@ -10,20 +10,21 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite:///./database.db"
     
     # JWT
-    SECRET_KEY: str = os.getenv("SECRET_KEY")
-    ALGORITHM: str = os.getenv("ALGORITHM")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES")
+    SECRET_KEY: str
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 43200 # 30 days
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 10080 # 7 days
     
     # Email (FastAPI-Mail)
-    MAIL_USERNAME: str = os.getenv("MAIL_USERNAME")
-    MAIL_PASSWORD: str = os.getenv("MAIL_PASSWORD")
-    MAIL_FROM: str = os.getenv("MAIL_FROM")
-    MAIL_PORT: int = os.getenv("MAIL_PORT")
-    MAIL_SERVER: str = os.getenv("MAIL_SERVER") 
-    MAIL_FROM_NAME: str = os.getenv("MAIL_FROM_NAME")
-    MAIL_STARTTLS: bool = os.getenv("MAIL_STARTTLS")
-    MAIL_SSL_TLS: bool = os.getenv("MAIL_SSL_TLS")
+    MAIL_USERNAME: str = ""
+    MAIL_PASSWORD: str = ""
+    MAIL_FROM: str = ""
+    MAIL_PORT: int = 587
+    MAIL_SERVER: str = "smtp.gmail.com" 
+    MAIL_FROM_NAME: str = "Council.ai"
+    MAIL_STARTTLS: bool = True
+    MAIL_SSL_TLS: bool = False
+
     USE_CREDENTIALS: bool = True
     VALIDATE_CERTS: bool = True
 
@@ -40,6 +41,8 @@ class Settings(BaseSettings):
     # Frontend URL (for OAuth redirect after login)
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
-    model_config = SettingsConfigDict(env_file=".env")
+    OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
