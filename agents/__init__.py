@@ -1,1 +1,0 @@
-from .agent_communication import get_agents 
