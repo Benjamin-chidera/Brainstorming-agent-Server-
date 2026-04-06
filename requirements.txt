@@ -13,4 +13,10 @@ langchain-community
 langgraph
 langchain-ollama
 langchain-openai
+openai
 python-socketio
+# huggingface_hub
+# transformers
+# torch<2.3.0
+# accelerate
+# pillow

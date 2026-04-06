@@ -46,16 +46,16 @@ def make_agent_node(agent_profile: dict):
             Expertise: {', '.join(agent_profile.get('expertise', []))}
             Personality: {', '.join(agent_profile.get('personality_traits', []))}
 
-            You are in a brainstorming meeting with: {', '.join(participant_names)} and a human moderator.
+            You are in a live brainstorming meeting with: {', '.join(participant_names)} and a human.
 
             Recent conversation:
             {history}
 
             Rules:
-            - Stay in character based on your personality traits.
-            - Keep responses concise and conversational (2-4 sentences).
-            - Build on or respectfully challenge others' ideas.
-            - If you genuinely have nothing meaningful to add, respond with exactly: [PASS]
+            - Stay in character. Be natural and conversational.
+            - Keep responses to 2-4 sentences.
+            - React to the last thing said — build on it, push back, or ask someone a follow-up question by name.
+            - If you have nothing to add right now, respond with exactly: [PASS]
             """),
             ("human", "{input}"),
         ])
@@ -244,3 +244,66 @@ def build_meeting_graph(agent_profiles: list[dict]):
     graph.add_conditional_edges("followup_check", followup_route, destinations)
 
     return graph.compile()
+
+
+# ──────────────────────────────────────────────
+# 5. Standalone Agent Runner (for autonomous continuation)
+# ──────────────────────────────────────────────
+async def run_single_agent(profile: dict, state: dict, continuation: bool = False) -> str | None:
+    """
+    Run one agent turn outside the graph — used by the autonomous conversation loop.
+    Returns the agent's response text, or None if they PASS.
+    """
+    messages = state.get("messages", [])
+    participant_names = [p["name"] for p in state.get("participants", [])]
+
+    history = ""
+    for m in messages[-12:]:
+        msg_type = getattr(m, "type", "unknown")
+        if msg_type == "human":
+            sender = "Human"
+        elif msg_type == "ai":
+            content_str = getattr(m, "content", "")
+            sender = content_str.split("]")[0].strip("[") if content_str.startswith("[") else "Agent"
+        else:
+            sender = msg_type
+        history += f"{sender}: {getattr(m, 'content', str(m))}\n"
+
+    if continuation:
+        trigger = (
+            "The human hasn't responded yet. Keep the meeting going — "
+            "continue the discussion with your fellow agents. You can build on the last idea, "
+            "challenge something, or ask a specific colleague a question by name."
+        )
+    else:
+        last = messages[-1] if messages else None
+        trigger = getattr(last, "content", "What are your thoughts?") if last else "What are your thoughts?"
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", f"""You are {profile['name']}.
+        Role: {profile.get('role', 'Participant')}
+        Skills: {', '.join(profile.get('skills', []))}
+        Expertise: {', '.join(profile.get('expertise', []))}
+        Personality: {', '.join(profile.get('personality_traits', []))}
+
+        You are in a live brainstorming meeting with: {', '.join(participant_names)} and a human.
+
+        Recent conversation:
+        {history}
+
+        Rules:
+        - Stay in character. Be natural and conversational.
+        - Keep responses to 2-3 sentences.
+        - React to the last thing said — build on it, push back, or direct a question at someone by name.
+        - If you have nothing to add right now, respond with exactly: [PASS]
+        """),
+        ("human", "{input}"),
+    ])
+
+    chain = prompt | llm | StrOutputParser()
+    response = await chain.ainvoke({"input": trigger})
+
+    if "[PASS]" in response:
+        return None
+
+    return response.strip()

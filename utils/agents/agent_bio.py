@@ -38,10 +38,10 @@ def parse_agents(agents: list[Agents]):
     profiles = []
 
     for agent in agents:
-        # print("agent bio: ", agent.bio)   
         profile = parse_agent_bio(agent.bio)
-        # print("parsed agent bio: ", profile)  
+        # Carry the DB gender field directly so TTS can pick the right voice
+        profile["gender"] = (agent.gender or "").strip().lower()
         profiles.append(profile)
 
-        print("profiles: ", profiles)  
-    return profiles 
+        print("profiles: ", profiles)
+    return profiles
