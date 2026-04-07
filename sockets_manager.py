@@ -331,5 +331,33 @@ async def user_audio(sid, data):
 @sio.event
 async def end_meeting(sid, data):
     meeting_id = str(data.get("meetingId", ""))
+    if not meeting_id:
+        return
+
     _cancel_continuation(meeting_id)
+    
+    # Mark meeting as ended in the database
+    from database import engine
+    from models import Meeting
+    from sqlmodel import Session
+    from datetime import datetime, timezone
+    
+    try:
+        with Session(engine) as session:
+            meeting_int_id = int(meeting_id)
+            meeting = session.get(Meeting, meeting_int_id)
+            if meeting:
+                meeting.status = "ended"
+                meeting.ended_at = datetime.now(timezone.utc)
+                session.add(meeting)
+                session.commit()
+    except Exception as e:
+        print(f"[Socket] Error ending meeting {meeting_id} in DB: {e}")
+
+    # Clean up memory state
+    from utils.store import active_graphs, meeting_states, meeting_profiles
+    active_graphs.pop(meeting_id, None)
+    meeting_states.pop(meeting_id, None)
+    meeting_profiles.pop(meeting_id, None)
+
     print(f"[Socket] Meeting {meeting_id} ended by {sid}")
