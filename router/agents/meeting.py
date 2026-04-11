@@ -16,7 +16,7 @@ route = APIRouter(
 # In-memory stores for active meeting graphs and state
 # These are shared with sockets_manager.py
 
-def restore_meeting_memory(meeting: Meeting):
+def restore_meeting_memory(meeting: Meeting, user: User = None):
     """Helper to reconstruct LangGraph and state in memory if it was lost during a server reload."""
     meeting_id = str(meeting.id)
     if meeting_id not in active_graphs:
@@ -26,13 +26,22 @@ def restore_meeting_memory(meeting: Meeting):
         active_graphs[meeting_id] = build_meeting_graph(profiles)
         
         if meeting_id not in meeting_states:
+            human_name = "User"
+            if user:
+                human_name = user.full_name or user.email.split("@")[0]
+            elif meeting.user:
+                human_name = meeting.user.full_name or meeting.user.email.split("@")[0]
+
             meeting_states[meeting_id] = {
                 "messages": [],
                 "meeting_id": meeting.id,
                 "current_speaker": "",
                 "participants": profiles,
                 "human_input": None,
+                "human_name": human_name,
                 "next_agents": [],
+                "agenda_set": False,
+                "waiting_for": None,
             }
     return meeting_id
 
@@ -71,7 +80,7 @@ def start_meeting(meeting_in: MeetingCreate, user: User = Depends(get_current_us
                 meeting_id = str(am.id)
                 
                 # If the server restarted, the meeting exists in DB but not in memory (store.py).
-                restore_meeting_memory(am)
+                restore_meeting_memory(am, user)
                 return {"message": "Active meeting already exists", "meeting_id": am.id, "success": True} 
 
         # Create meeting in DB
@@ -91,13 +100,20 @@ def start_meeting(meeting_in: MeetingCreate, user: User = Depends(get_current_us
         active_graphs[meeting_id] = graph
 
         # Initialize the meeting state
+        human_name = meeting_in.userName
+        if not human_name or not human_name.strip():
+            human_name = user.full_name or user.email.split("@")[0]
+            
         meeting_states[meeting_id] = {
             "messages": [],
             "meeting_id": db_meeting.id,
             "current_speaker": "",
             "participants": profiles,
             "human_input": None,
+            "human_name": human_name,
             "next_agents": [],
+            "agenda_set": False,
+            "waiting_for": None,
         }
 
         print(f"[Meeting] Built graph for meeting {meeting_id} with agents: {[p['name'] for p in profiles]}")
@@ -121,7 +137,7 @@ def check_active_meeting(user: User = Depends(get_current_user), session: Sessio
         active_meetings = session.exec(select(Meeting).where(Meeting.user_id == user.id, Meeting.status == "active")).all()
         if active_meetings:
             am = active_meetings[0]
-            restore_meeting_memory(am) # Fixes memory loss if the page was refreshed after standard reload
+            restore_meeting_memory(am, user) # Fixes memory loss if the page was refreshed after standard reload
             return {"message": "Active meeting already exists", "meeting_id": am.id, "success": True} 
         return {"message": "No active meeting", "success": False}
     except Exception as e: 
@@ -129,3 +145,45 @@ def check_active_meeting(user: User = Depends(get_current_user), session: Sessio
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )          
+
+@route.delete("/delete-meeting/{meeting_id}", status_code=status.HTTP_200_OK)
+async def delete_meeting(meeting_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    try:
+        meeting = session.get(Meeting, meeting_id)
+        if not meeting:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Meeting not found"
+            )
+
+        if meeting.user_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to delete this meeting"
+            )
+
+        # Cancel autonomous conversation loop and clean up memory
+        mid_str = str(meeting_id)
+        from sockets_manager import _cancel_continuation, _muted_agents, sio
+        _cancel_continuation(mid_str)
+        _muted_agents.pop(mid_str, None)
+
+        active_graphs.pop(mid_str, None)
+        meeting_states.pop(mid_str, None)
+        meeting_profiles.pop(mid_str, None)
+
+        session.delete(meeting)
+        session.commit()
+
+        # Notify all clients in the room that the meeting was deleted
+        await sio.emit("meeting_ended", {}, room=mid_str)
+
+        return {"message": "Meeting deleted successfully", "success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )

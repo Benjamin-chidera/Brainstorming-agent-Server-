@@ -7,6 +7,11 @@ from utils.auth import verify_token
 # cors_allowed_origins=[] disables Socket.IO's internal CORS handling so FastAPI's CORSMiddleware does it.
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins=[])
 
+# ── Per-meeting muted agent sets ──────────────────────────────────────────────
+# Maps meeting_id (str) → set of muted agent IDs (str).
+# Agents in this set will be skipped during TTS / audio emission.
+_muted_agents: dict[str, set[str]] = {}
+
 # OpenAI voices split by gender
 _MALE_VOICES   = ["onyx", "echo", "fable"]
 _FEMALE_VOICES = ["nova", "shimmer", "alloy"]
@@ -27,7 +32,20 @@ def _voice_for_agent(name: str, meeting_id: str) -> str:
     return pool[hash(name) % len(pool)]
 
 async def _emit_tts(text: str, sender: str, room: str, meeting_id: str):
-    """Generate TTS for an agent response and emit agent_audio to the room."""
+    """Generate TTS for an agent response and emit agent_audio to the room.
+    
+    Skips synthesis entirely if the agent is muted for this meeting.
+    """
+    # Check if sender is muted (match by name against muted agent ID set)
+    muted = _muted_agents.get(meeting_id, set())
+    if muted:
+        from utils.store import meeting_profiles
+        profiles = meeting_profiles.get(meeting_id, [])
+        agent = next((p for p in profiles if p.get("name", "").lower() == sender.lower()), None)
+        agent_id = str(agent.get("id", "")) if agent else ""
+        if agent_id and agent_id in muted:
+            print(f"[TTS] Skipping muted agent: {sender} ({agent_id})")
+            return
     try:
         from utils.agents.agent_tts import synthesize_speech
         voice = _voice_for_agent(sender, meeting_id)
@@ -36,6 +54,37 @@ async def _emit_tts(text: str, sender: str, room: str, meeting_id: str):
             await sio.emit("agent_audio", {"sender": sender, "audio": audio_b64}, room=room)
     except Exception as e:
         print(f"[TTS] Failed for {sender}: {e}")
+
+# ── Sequential TTS Queue ──────────────────────────────────────────────────────
+_tts_queues: dict[str, asyncio.Queue] = {}
+_tts_tasks: dict[str, asyncio.Task] = {}
+
+async def _tts_worker(meeting_id: str):
+    queue = _tts_queues[meeting_id]
+    try:
+        while True:
+            text, sender, room = await queue.get()
+            await _emit_tts(text, sender, room, meeting_id)
+            queue.task_done()
+    except asyncio.CancelledError:
+        pass
+
+def _enqueue_tts(text: str, sender: str, room: str, meeting_id: str):
+    if meeting_id not in _tts_queues:
+        _tts_queues[meeting_id] = asyncio.Queue()
+        _tts_tasks[meeting_id] = asyncio.create_task(_tts_worker(meeting_id))
+    _tts_queues[meeting_id].put_nowait((text, sender, room))
+
+def _clear_tts_queue(meeting_id: str):
+    if meeting_id in _tts_queues:
+        q = _tts_queues[meeting_id]
+        while not q.empty():
+            try:
+                q.get_nowait()
+                q.task_done()
+            except asyncio.QueueEmpty:
+                break
+
 
 
 # ── Autonomous conversation loop ──────────────────────────────────────────────
@@ -59,17 +108,49 @@ def _start_continuation(meeting_id: str, room: str):
 async def _autonomous_conversation(meeting_id: str, room: str):
     """
     Keeps the meeting alive when the human is idle.
-    Rotates through agents, giving each a chance to speak.
+    - First run: if agenda hasn't been set yet, one agent asks for the agenda.
+    - If an agent asked a question, respects waiting_for before resuming free talk.
+    - Rotates through agents, giving each a chance to speak.
     Runs until cancelled (by a new human message or meeting end).
     """
     import random
     from utils.store import meeting_states, meeting_profiles
-    from utils.agents.agents import run_single_agent
+    from utils.agents.agents import run_single_agent, _extract_question_target
     from langchain_core.messages import AIMessage
 
     # Brief pause before agents continue on their own
     await asyncio.sleep(4)
 
+    profiles = meeting_profiles.get(meeting_id, [])
+    state = meeting_states.get(meeting_id)
+    if not profiles or state is None:
+        return
+
+    # ── Step 1: Ask for agenda after first introduction round ──────────────────
+    # If the agenda hasn't been set yet and there are already messages (agents have spoken),
+    # have the first agent in the list ask the human what today's agenda is.
+    if not state.get("agenda_set", False) and state.get("messages"):
+        first_agent = profiles[0]
+        name = first_agent["name"]
+        human_name = state.get("human_name", "everyone")
+        agenda_question = (
+            f"Before we dive in — {human_name}, what's the agenda for today's meeting? "
+            f"What would you like us to focus on?"
+        )
+        await sio.emit("chat_update", {"sender": name, "text": agenda_question}, room=room)
+        _enqueue_tts(agenda_question, name, room, meeting_id)
+
+        updated = dict(state)
+        updated["messages"] = list(state.get("messages", [])) + [
+            AIMessage(content=f"[{name}]: {agenda_question}")
+        ]
+        updated["agenda_set"] = True
+        updated["waiting_for"] = human_name  # wait for human to reply with agenda
+        meeting_states[meeting_id] = updated
+        # After asking the agenda question, stop — wait for human's response
+        return
+
+    # ── Step 2: Free-flowing autonomous conversation ───────────────────────────
     last_speaker: str | None = None
 
     while True:
@@ -78,7 +159,57 @@ async def _autonomous_conversation(meeting_id: str, room: str):
         if not profiles or state is None:
             break
 
-        # Pick an agent that isn't the one who just spoke, with some randomness
+        human_name = state.get("human_name", "Human")
+        waiting_for = state.get("waiting_for")
+
+        # If waiting for the human to answer, pause and recheck — don't speak over them
+        if waiting_for and waiting_for.lower() == human_name.lower():
+            await asyncio.sleep(6)
+            # Re-read state: if human has responded, waiting_for would be cleared
+            state = meeting_states.get(meeting_id)
+            if state and state.get("waiting_for", "").lower() == human_name.lower():
+                # Still waiting — keep pausing silently
+                continue
+            # waiting_for was cleared (human responded) → fall through to normal turn
+            profiles = meeting_profiles.get(meeting_id, [])
+            state = meeting_states.get(meeting_id)
+            if not profiles or state is None:
+                break
+            waiting_for = state.get("waiting_for")
+
+        # If an agent asked another agent a question, let that agent respond first
+        if waiting_for:
+            agent = next((p for p in profiles if p["name"].lower() == waiting_for.lower()), None)
+            if agent:
+                name = agent["name"]
+                try:
+                    response = await run_single_agent(agent, state, continuation=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[Continuation] Error for {name}: {e}")
+                    await asyncio.sleep(5)
+                    continue
+
+                updated = dict(state)
+                updated["waiting_for"] = None  # clear — question has been answered
+                if response:
+                    await sio.emit("chat_update", {"sender": name, "text": response}, room=room)
+                    _enqueue_tts(response, name, room, meeting_id)
+                    updated["messages"] = list(state.get("messages", [])) + [
+                        AIMessage(content=f"[{name}]: {response}")
+                    ]
+                    # Detect if this agent also asked a question
+                    participant_names = [p["name"] for p in profiles]
+                    new_target = _extract_question_target(response, participant_names, human_name)
+                    updated["waiting_for"] = new_target
+                    last_speaker = name
+
+                meeting_states[meeting_id] = updated
+                await asyncio.sleep(random.uniform(3, 5))
+                continue
+
+        # Normal random-turn selection (skip last speaker for variety)
         candidates = [p for p in profiles if p.get("name") != last_speaker]
         if not candidates:
             candidates = profiles
@@ -96,14 +227,16 @@ async def _autonomous_conversation(meeting_id: str, room: str):
 
         if response:
             await sio.emit("chat_update", {"sender": name, "text": response}, room=room)
-            asyncio.create_task(_emit_tts(response, name, room, meeting_id))
+            _enqueue_tts(response, name, room, meeting_id)
 
-            # Persist the message into the shared state
-            updated_state = dict(state)
-            updated_state["messages"] = list(state.get("messages", [])) + [
+            updated = dict(state)
+            updated["messages"] = list(state.get("messages", [])) + [
                 AIMessage(content=f"[{name}]: {response}")
             ]
-            meeting_states[meeting_id] = updated_state
+            # Detect if this agent asked someone a question
+            participant_names = [p["name"] for p in profiles]
+            updated["waiting_for"] = _extract_question_target(response, participant_names, human_name)
+            meeting_states[meeting_id] = updated
             last_speaker = name
 
         # Natural pause between autonomous turns (3–6 seconds)
@@ -177,6 +310,19 @@ async def join_meeting(sid, data):
         )
 
 @sio.event
+async def user_typing(sid, data):
+    """
+    Triggered when the user starts typing or activates their mic.
+    Cancels the autonomous conversation loop so agents don't interrupt.
+    """
+    meeting_id = str(data.get("meeting_id", ""))
+    if meeting_id:
+        _cancel_continuation(meeting_id)
+        _clear_tts_queue(meeting_id)
+        print(f"[Socket] User typing in room {meeting_id} — autonomous loop paused")
+
+
+@sio.event
 async def user_message(sid, data):
     """
     Triggered when the user sends a message in the meeting.
@@ -188,6 +334,7 @@ async def user_message(sid, data):
 
     # Human is speaking — stop autonomous loop immediately
     _cancel_continuation(meeting_id)
+    _clear_tts_queue(meeting_id)
 
     print(f"[Socket] Message from {sid} in room {room}: {text}")
 
@@ -213,6 +360,10 @@ async def user_message(sid, data):
     from langchain_core.messages import HumanMessage
     state = meeting_states.get(meeting_id, {})
     state["human_input"] = text
+    # Human responded — clear any pending question target
+    state["waiting_for"] = None
+    # Ensure new state fields have defaults
+    state.setdefault("agenda_set", False)
     # Add the human's message so agents can see it as the last message in history
     state.setdefault("messages", [])
     state["messages"] = list(state["messages"]) + [HumanMessage(content=text)]
@@ -243,13 +394,13 @@ async def user_message(sid, data):
                             name = content.split("]")[0].strip("[")
                             response_text = content.split("]: ", 1)[1] if "]: " in content else content
                             await sio.emit("chat_update", {"sender": name, "text": response_text}, room=room)
-                            asyncio.create_task(_emit_tts(response_text, name, room, meeting_id))
+                            _enqueue_tts(response_text, name, room, meeting_id)
                         except (IndexError, ValueError):
                             await sio.emit("chat_update", {"sender": "Agent", "text": content}, room=room)
-                            asyncio.create_task(_emit_tts(content, "Agent", room, meeting_id))
+                            _enqueue_tts(content, "Agent", room, meeting_id)
                     else:
                         await sio.emit("chat_update", {"sender": "Agent", "text": content}, room=room)
-                        asyncio.create_task(_emit_tts(content, "Agent", room, meeting_id))
+                        _enqueue_tts(content, "Agent", room, meeting_id)
                         
                 current_msg_count = new_msgs_count
                 
@@ -359,5 +510,44 @@ async def end_meeting(sid, data):
     active_graphs.pop(meeting_id, None)
     meeting_states.pop(meeting_id, None)
     meeting_profiles.pop(meeting_id, None)
+    _muted_agents.pop(meeting_id, None)  # clear mute state for this meeting
+    _clear_tts_queue(meeting_id)
+    task = _tts_tasks.pop(meeting_id, None)
+    if task:
+        task.cancel()
+    _tts_queues.pop(meeting_id, None)
 
+    # Notify all room members that the meeting has ended (stops audio/UI on all clients)
+    await sio.emit("meeting_ended", {}, room=meeting_id)
     print(f"[Socket] Meeting {meeting_id} ended by {sid}")
+
+
+@sio.event
+async def mute_agent(sid, data):
+    """
+    Triggered when the user mutes a specific agent.
+    The agent's ID is added to the muted set for this meeting so that
+    subsequent TTS calls for that agent are suppressed server-side.
+    """
+    meeting_id = str(data.get("meeting_id", ""))
+    agent_id   = str(data.get("agent_id", ""))
+    if not meeting_id or not agent_id:
+        return
+
+    _muted_agents.setdefault(meeting_id, set()).add(agent_id)
+    print(f"[Socket] Agent {agent_id} muted in meeting {meeting_id} by {sid}")
+
+
+@sio.event
+async def unmute_agent(sid, data):
+    """
+    Triggered when the user unmutes a specific agent.
+    Removes the agent from the muted set so TTS resumes for that agent.
+    """
+    meeting_id = str(data.get("meeting_id", ""))
+    agent_id   = str(data.get("agent_id", ""))
+    if not meeting_id or not agent_id:
+        return
+
+    _muted_agents.get(meeting_id, set()).discard(agent_id)
+    print(f"[Socket] Agent {agent_id} unmuted in meeting {meeting_id} by {sid}")

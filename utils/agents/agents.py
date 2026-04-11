@@ -9,6 +9,25 @@ from langchain_core.messages import AIMessage, HumanMessage
 # llm = ChatOllama(model="deepseek-r1:8b")
 llm = ChatOpenAI(model="gpt-3.5-turbo")
 
+
+def _extract_question_target(text: str, participant_names: list[str], human_name: str) -> str | None:
+    """
+    Detect if a message ends with a question and identify who it's directed at.
+    Returns the target's name, or None if no directed question is found.
+    """
+    if "?" not in text:
+        return None
+    text_lower = text.lower()
+    # Search for the name that appears latest in the text (most likely the addressee)
+    last_pos = -1
+    target = None
+    for name in participant_names + [human_name]:
+        pos = text_lower.rfind(name.lower())
+        if pos > last_pos:
+            last_pos = pos
+            target = name
+    return target
+
 # ──────────────────────────────────────────────
 # 1. Agent Node Factory
 # ──────────────────────────────────────────────
@@ -19,12 +38,13 @@ def make_agent_node(agent_profile: dict):
     """
 
     async def agent_node(state: MeetingState) -> dict:
+        human_name = state.get("human_name", "Human")
         # Build recent conversation context (last 10 messages)
         history = ""
         for m in state.get("messages", [])[-10:]:
             msg_type = getattr(m, "type", "unknown")
             if msg_type == "human":
-                sender = "Human"
+                sender = human_name
             elif msg_type == "ai":
                 content_str = getattr(m, "content", "")
                 # Extract agent name from "[AgentName]: ..." format
@@ -38,24 +58,29 @@ def make_agent_node(agent_profile: dict):
             history += f"{sender}: {content}\n"
 
         participant_names = [p["name"] for p in state.get("participants", [])]
+        agent_name = agent_profile['name']
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are {agent_profile['name']}.
+            ("system", f"""You are {agent_name}.
             Role: {agent_profile.get('role', 'Participant')}
             Skills: {', '.join(agent_profile.get('skills', []))}
             Expertise: {', '.join(agent_profile.get('expertise', []))}
             Personality: {', '.join(agent_profile.get('personality_traits', []))}
 
-            You are in a live brainstorming meeting with: {', '.join(participant_names)} and a human.
+            You are in a live, professional meeting with: {', '.join([p for p in participant_names if p != agent_name])} and the human user, {human_name}.
 
             Recent conversation:
             {history}
 
             Rules:
-            - Stay in character. Be natural and conversational.
-            - Keep responses to 2-4 sentences.
-            - React to the last thing said — build on it, push back, or ask someone a follow-up question by name.
-            - If you have nothing to add right now, respond with exactly: [PASS]
+            - Stay in character. Be natural, professional, and focus on the meeting's core discussion or goal.
+            - Keep responses concise (2-4 sentences). Do not ramble.
+            - If {human_name} asked an open question to the group or asked for everyone to introduce themselves, fulfill your part directly. Do NOT ask the previous agent questions about their introduction—let everyone finish first.
+            - If the meeting's agenda or topic is not yet clear, politely ask {human_name} what specifically we are discussing today.
+            - Otherwise, react to the last thing said — build on it, push back, or ask a specific colleague a follow-up question.
+            - NEVER address yourself or ask yourself a question (you are {agent_name}). Talk to other agents or {human_name}.
+            - Avoid AI cliches. Speak like a real human expert.
+            - If you have nothing to add right now or someone else is better suited, respond with exactly: [PASS]
             """),
             ("human", "{input}"),
         ])
@@ -75,9 +100,13 @@ def make_agent_node(agent_profile: dict):
         if "[PASS]" in response:
             return {"current_speaker": agent_profile["name"]}
 
+        participant_names = [p["name"] for p in state.get("participants", [])]
+        waiting_for = _extract_question_target(response, participant_names, human_name)
+
         return {
             "messages": [AIMessage(content=f"[{agent_profile['name']}]: {response}")],
             "current_speaker": agent_profile["name"],
+            "waiting_for": waiting_for,
         }
 
     # Name the function for debugging
@@ -109,7 +138,9 @@ def make_router_node(agent_profiles: list[dict]):
                 addressed_agent = name
 
         if addressed_agent:
-            remaining = [n for n in agent_names if n != addressed_agent]
+            # Check if the user wants ONLY this agent to reply (e.g. "only Jack should reply")
+            is_exclusive = "only" in human_input.lower() and addressed_agent.lower() in human_input.lower()
+            remaining = [] if is_exclusive else [n for n in agent_names if n != addressed_agent]
             return {
                 "current_speaker": addressed_agent,
                 "next_agents": remaining,
@@ -257,11 +288,12 @@ async def run_single_agent(profile: dict, state: dict, continuation: bool = Fals
     messages = state.get("messages", [])
     participant_names = [p["name"] for p in state.get("participants", [])]
 
+    human_name = state.get("human_name", "Human")
     history = ""
     for m in messages[-12:]:
         msg_type = getattr(m, "type", "unknown")
         if msg_type == "human":
-            sender = "Human"
+            sender = human_name
         elif msg_type == "ai":
             content_str = getattr(m, "content", "")
             sender = content_str.split("]")[0].strip("[") if content_str.startswith("[") else "Agent"
@@ -271,31 +303,36 @@ async def run_single_agent(profile: dict, state: dict, continuation: bool = Fals
 
     if continuation:
         trigger = (
-            "The human hasn't responded yet. Keep the meeting going — "
+            f"{human_name} hasn't responded yet. Keep the meeting going — "
             "continue the discussion with your fellow agents. You can build on the last idea, "
-            "challenge something, or ask a specific colleague a question by name."
+            "challenge something, or ask a specific colleague a question by name to drive the professional agenda forward."
         )
     else:
         last = messages[-1] if messages else None
         trigger = getattr(last, "content", "What are your thoughts?") if last else "What are your thoughts?"
 
+    agent_name = profile['name']
     prompt = ChatPromptTemplate.from_messages([
-        ("system", f"""You are {profile['name']}.
+        ("system", f"""You are {agent_name}.
         Role: {profile.get('role', 'Participant')}
         Skills: {', '.join(profile.get('skills', []))}
         Expertise: {', '.join(profile.get('expertise', []))}
         Personality: {', '.join(profile.get('personality_traits', []))}
 
-        You are in a live brainstorming meeting with: {', '.join(participant_names)} and a human.
+        You are in a live, professional meeting with: {', '.join([p for p in participant_names if p != agent_name])} and the human user, {human_name}.
 
         Recent conversation:
         {history}
 
         Rules:
-        - Stay in character. Be natural and conversational.
-        - Keep responses to 2-3 sentences.
-        - React to the last thing said — build on it, push back, or direct a question at someone by name.
-        - If you have nothing to add right now, respond with exactly: [PASS]
+        - Stay in character. Be natural, professional, and focus on the meeting's core discussion or goal.
+        - Keep responses concise (2-3 sentences). Do not ramble.
+        - If {human_name} asked an open question to the group or asked for everyone to introduce themselves, fulfill your part directly. Do NOT ask the previous agent questions about their introduction—let everyone finish first.
+        - If the meeting's agenda or topic is not yet clear, politely ask {human_name} what specifically we are discussing today.
+        - Otherwise, react to the last thing said — build on it, push back, or direct a question at someone by name to keep things moving.
+        - NEVER address yourself or ask yourself a question (you are {agent_name}). Talk to other agents or {human_name}.
+        - Avoid AI cliches. Speak like a real human expert.
+        - If you have nothing to add right now or someone else is better suited, respond with exactly: [PASS]
         """),
         ("human", "{input}"),
     ])
