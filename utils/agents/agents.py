@@ -60,6 +60,25 @@ def make_agent_node(agent_profile: dict):
         participant_names = [p["name"] for p in state.get("participants", [])]
         agent_name = agent_profile['name']
 
+        # Detect whether THIS agent was directly asked a question
+        waiting_for = state.get("waiting_for")
+        is_being_addressed = (
+            waiting_for and waiting_for.lower() == agent_name.lower()
+        )
+
+        if is_being_addressed:
+            turn_rule = (
+                f"- You were just directly asked a question. "
+                f"ANSWER IT NOW — give a clear, direct answer first. "
+                f"Do NOT ask another question in this response. Do NOT deflect. Just answer."
+            )
+        else:
+            turn_rule = (
+                f"- React to the last thing said — build on it, push back, or ask a specific colleague a follow-up question.\n"
+                f"- IMPORTANT: If someone was just directly asked a question and hasn't answered yet, "
+                f"do NOT speak until they have had their turn. Let them answer first."
+            )
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", f"""You are {agent_name}.
             Role: {agent_profile.get('role', 'Participant')}
@@ -77,7 +96,7 @@ def make_agent_node(agent_profile: dict):
             - Keep responses concise (2-4 sentences). Do not ramble.
             - If {human_name} asked an open question to the group or asked for everyone to introduce themselves, fulfill your part directly. Do NOT ask the previous agent questions about their introduction—let everyone finish first.
             - If the meeting's agenda or topic is not yet clear, politely ask {human_name} what specifically we are discussing today.
-            - Otherwise, react to the last thing said — build on it, push back, or ask a specific colleague a follow-up question.
+            {turn_rule}
             - NEVER address yourself or ask yourself a question (you are {agent_name}). Talk to other agents or {human_name}.
             - Avoid AI cliches. Speak like a real human expert.
             - If you have nothing to add right now or someone else is better suited, respond with exactly: [PASS]
@@ -98,15 +117,17 @@ def make_agent_node(agent_profile: dict):
 
         # If agent passes, don't add a message
         if "[PASS]" in response:
-            return {"current_speaker": agent_profile["name"]}
+            return {"current_speaker": agent_profile["name"], "waiting_for": None}
 
         participant_names = [p["name"] for p in state.get("participants", [])]
-        waiting_for = _extract_question_target(response, participant_names, human_name)
+        # Only detect a new question target if this agent wasn't already answering one —
+        # we don't want an answering agent to immediately redirect the floor again.
+        new_waiting_for = None if is_being_addressed else _extract_question_target(response, participant_names, human_name)
 
         return {
             "messages": [AIMessage(content=f"[{agent_profile['name']}]: {response}")],
             "current_speaker": agent_profile["name"],
-            "waiting_for": waiting_for,
+            "waiting_for": new_waiting_for,
         }
 
     # Name the function for debugging
@@ -191,6 +212,17 @@ def make_followup_check():
 
     async def followup_check(state: MeetingState) -> dict:
         remaining = list(state.get("next_agents", []))
+        waiting_for = state.get("waiting_for")
+        participant_names = [p["name"] for p in state.get("participants", [])]
+
+        # If a specific agent was asked a question, they go next — no one else cuts in.
+        if waiting_for and any(p.lower() == waiting_for.lower() for p in participant_names):
+            # Remove from the queue if already in it (they'll speak now, not later)
+            remaining_without = [n for n in remaining if n.lower() != waiting_for.lower()]
+            return {
+                "current_speaker": waiting_for,
+                "next_agents": remaining_without,
+            }
 
         if remaining:
             next_speaker = remaining.pop(0)
@@ -301,17 +333,40 @@ async def run_single_agent(profile: dict, state: dict, continuation: bool = Fals
             sender = msg_type
         history += f"{sender}: {getattr(m, 'content', str(m))}\n"
 
-    if continuation:
+    agent_name = profile['name']
+    waiting_for = state.get("waiting_for")
+    is_being_addressed = waiting_for and waiting_for.lower() == agent_name.lower()
+
+    if is_being_addressed:
+        # This agent was directly asked — force an answer, no new questions
+        trigger = (
+            f"You were directly asked a question in the conversation above. "
+            f"Answer it now clearly and concisely. Do NOT ask another question."
+        )
+        turn_rule = (
+            f"- You were just directly asked a question. ANSWER IT — give a clear, direct answer. "
+            f"Do NOT ask another question in this response. Do NOT deflect. Just answer."
+        )
+    elif continuation:
         trigger = (
             f"{human_name} hasn't responded yet. Keep the meeting going — "
             "continue the discussion with your fellow agents. You can build on the last idea, "
             "challenge something, or ask a specific colleague a question by name to drive the professional agenda forward."
         )
+        turn_rule = (
+            f"- React to the last thing said — build on it, push back, or direct a question at someone by name.\n"
+            f"- IMPORTANT: If a specific agent was directly asked a question and hasn't answered yet, "
+            f"do NOT speak until they have — output [PASS] to yield the floor to them."
+        )
     else:
         last = messages[-1] if messages else None
         trigger = getattr(last, "content", "What are your thoughts?") if last else "What are your thoughts?"
+        turn_rule = (
+            f"- React to the last thing said — build on it, push back, or ask a specific colleague a follow-up question.\n"
+            f"- IMPORTANT: If a specific agent was directly asked a question and hasn't answered yet, "
+            f"do NOT speak until they have — output [PASS] to yield the floor to them."
+        )
 
-    agent_name = profile['name']
     prompt = ChatPromptTemplate.from_messages([
         ("system", f"""You are {agent_name}.
         Role: {profile.get('role', 'Participant')}
@@ -329,7 +384,7 @@ async def run_single_agent(profile: dict, state: dict, continuation: bool = Fals
         - Keep responses concise (2-3 sentences). Do not ramble.
         - If {human_name} asked an open question to the group or asked for everyone to introduce themselves, fulfill your part directly. Do NOT ask the previous agent questions about their introduction—let everyone finish first.
         - If the meeting's agenda or topic is not yet clear, politely ask {human_name} what specifically we are discussing today.
-        - Otherwise, react to the last thing said — build on it, push back, or direct a question at someone by name to keep things moving.
+        {turn_rule}
         - NEVER address yourself or ask yourself a question (you are {agent_name}). Talk to other agents or {human_name}.
         - Avoid AI cliches. Speak like a real human expert.
         - If you have nothing to add right now or someone else is better suited, respond with exactly: [PASS]

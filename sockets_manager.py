@@ -193,13 +193,15 @@ async def _autonomous_conversation(meeting_id: str, room: str):
 
                 updated = dict(state)
                 updated["waiting_for"] = None  # clear — question has been answered
+
                 if response:
                     await sio.emit("chat_update", {"sender": name, "text": response}, room=room)
                     _enqueue_tts(response, name, room, meeting_id)
                     updated["messages"] = list(state.get("messages", [])) + [
                         AIMessage(content=f"[{name}]: {response}")
                     ]
-                    # Detect if this agent also asked a question
+                    # Only detect a NEW question target if this agent wasn't the one answering —
+                    # answering agents should not immediately redirect the floor.
                     participant_names = [p["name"] for p in profiles]
                     new_target = _extract_question_target(response, participant_names, human_name)
                     updated["waiting_for"] = new_target
@@ -208,6 +210,12 @@ async def _autonomous_conversation(meeting_id: str, room: str):
                 meeting_states[meeting_id] = updated
                 await asyncio.sleep(random.uniform(3, 5))
                 continue
+            else:
+                # waiting_for target not found — clear it so the loop doesn't stall
+                updated = dict(state)
+                updated["waiting_for"] = None
+                meeting_states[meeting_id] = updated
+                state = updated
 
         # Normal random-turn selection (skip last speaker for variety)
         candidates = [p for p in profiles if p.get("name") != last_speaker]
