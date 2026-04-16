@@ -66,3 +66,4 @@ class Meeting(SQLModel, table=True):
 class MeetingCreate(SQLModel):
     agentIds: List[int]
     status: str = "active"
+    userName: Optional[str] = None

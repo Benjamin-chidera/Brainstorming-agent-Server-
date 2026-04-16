@@ -36,6 +36,7 @@ app.include_router(auth, prefix="/api/v1")
 app.include_router(agents.bio, prefix="/api/v1")
 app.include_router(agents.create_council, prefix="/api/v1") 
 app.include_router(agents.meeting, prefix="/api/v1")    
+app.include_router(agents.live_meeting_room, prefix="/api/v1")
 
 @app.get("/")
 def read_root():

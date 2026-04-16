@@ -130,22 +130,25 @@ async def verify_otp(
         access_token = create_access_token(data={"sub": user.email, "id": user.id})
         refresh_token = create_refresh_token(data={"sub": user.email, "id": user.id})
 
+        cookie_max_age = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        
         response.set_cookie(
             key="access_token",
             value=access_token,
             httponly=True,
-            max_age=1800,
-            expires=1800,
+            max_age=cookie_max_age,
+            expires=cookie_max_age,
             path="/",
             samesite="lax",
             secure=True,
         )
+        refresh_max_age = settings.REFRESH_TOKEN_EXPIRE_MINUTES * 60
         response.set_cookie(
             key="refresh_token",
             value=refresh_token,
             httponly=True,
-            max_age=10080 * 60,
-            expires=10080 * 60,
+            max_age=refresh_max_age,
+            expires=refresh_max_age,
             path="/",
             samesite="lax",
             secure=True,
@@ -184,12 +187,13 @@ async def refresh_access_token(
         
     new_access_token = create_access_token(data={"sub": email, "id": user_id})
 
+    cookie_max_age = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     response.set_cookie(
         key="access_token",
         value=new_access_token,
         httponly=True,
-        max_age=1800,
-        expires=1800,
+        max_age=cookie_max_age,
+        expires=cookie_max_age,
         path="/",
         samesite="lax",
         secure=True,
@@ -204,22 +208,24 @@ def _build_oauth_redirect(user, response_class=RedirectResponse):
     refresh_token = create_refresh_token(data={"sub": user.email, "id": user.id})
 
     redirect = response_class(url=settings.FRONTEND_URL, status_code=302)
+    cookie_max_age = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     redirect.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
-        max_age=1800,
-        expires=1800,
+        max_age=cookie_max_age,
+        expires=cookie_max_age,
         path="/",
         samesite="lax",
         secure=True,
     )
+    refresh_max_age = settings.REFRESH_TOKEN_EXPIRE_MINUTES * 60
     redirect.set_cookie(
         key="refresh_token",
         value=refresh_token,
         httponly=True,
-        max_age=10080 * 60,
-        expires=10080 * 60,
+        max_age=refresh_max_age,
+        expires=refresh_max_age,
         path="/",
         samesite="lax",
         secure=True,
