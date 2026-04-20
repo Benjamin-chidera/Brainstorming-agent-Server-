@@ -2,6 +2,12 @@ import socketio
 import asyncio
 from http import cookies
 from utils.auth import verify_token
+from utils.agents.vector_store import sync_message_to_pinecone
+from utils.agents.summarizer import summarize_meeting, agent_summarize_meeting
+from sqlmodel import Session, select
+from database import engine
+from models import Message, Meeting
+from datetime import datetime, timezone
 
 # Create a Socket.IO asynchronous server
 # cors_allowed_origins=[] disables Socket.IO's internal CORS handling so FastAPI's CORSMiddleware does it.
@@ -30,6 +36,22 @@ def _voice_for_agent(name: str, meeting_id: str) -> str:
         pool = _MALE_VOICES + _FEMALE_VOICES  # unknown gender → any
 
     return pool[hash(name) % len(pool)]
+
+def _save_message_to_db(meeting_id: str, sender_type: str, sender_name: str, content: str):
+    """Save a single message to the SQL database for ephemeral persistence."""
+    try:
+        with Session(engine) as session:
+            new_msg = Message(
+                meeting_id=int(meeting_id),
+                sender_type=sender_type,
+                sender_name=sender_name,
+                content=content,
+                created_at=datetime.now(timezone.utc)
+            )
+            session.add(new_msg)
+            session.commit()
+    except Exception as e:
+        print(f"[DB Save] Failed to save message: {e}")
 
 async def _emit_tts(text: str, sender: str, room: str, meeting_id: str):
     """Generate TTS for an agent response and emit agent_audio to the room.
@@ -139,6 +161,8 @@ async def _autonomous_conversation(meeting_id: str, room: str):
         )
         await sio.emit("chat_update", {"sender": name, "text": agenda_question}, room=room)
         _enqueue_tts(agenda_question, name, room, meeting_id)
+        sync_message_to_pinecone(meeting_id, name, agenda_question)
+        _save_message_to_db(meeting_id, "agent", name, agenda_question)
 
         updated = dict(state)
         updated["messages"] = list(state.get("messages", [])) + [
@@ -197,6 +221,8 @@ async def _autonomous_conversation(meeting_id: str, room: str):
                 if response:
                     await sio.emit("chat_update", {"sender": name, "text": response}, room=room)
                     _enqueue_tts(response, name, room, meeting_id)
+                    sync_message_to_pinecone(meeting_id, name, response)
+                    _save_message_to_db(meeting_id, "agent", name, response)
                     updated["messages"] = list(state.get("messages", [])) + [
                         AIMessage(content=f"[{name}]: {response}")
                     ]
@@ -236,6 +262,8 @@ async def _autonomous_conversation(meeting_id: str, room: str):
         if response:
             await sio.emit("chat_update", {"sender": name, "text": response}, room=room)
             _enqueue_tts(response, name, room, meeting_id)
+            sync_message_to_pinecone(meeting_id, name, response)
+            _save_message_to_db(meeting_id, "agent", name, response)
 
             updated = dict(state)
             updated["messages"] = list(state.get("messages", [])) + [
@@ -348,7 +376,47 @@ async def user_message(sid, data):
 
     # Broadcast the user's message back to the room so it shows up in the UI
     await sio.emit("chat_update", {"sender": "You", "text": text}, room=room)
+    _save_message_to_db(meeting_id, "human", "You", text)
     
+    # Sync to Vector DB (Pinecone) for long-term memory
+    sync_message_to_pinecone(meeting_id, "You", text)
+
+    # Check if user is asking an agent to summarize the meeting
+    _summarize_keywords = ["summarize", "summary", "recap", "wrap up", "sum up"]
+    if any(kw in text.lower() for kw in _summarize_keywords):
+        from utils.store import meeting_states, meeting_profiles
+        profiles = meeting_profiles.get(meeting_id, [])
+        state = meeting_states.get(meeting_id, {})
+        messages = state.get("messages", [])
+
+        # Find which agent was addressed by name, fallback to first agent
+        text_lower = text.lower()
+        addressed_agent = next(
+            (p for p in profiles if p["name"].lower() in text_lower),
+            profiles[0] if profiles else None
+        )
+
+        if addressed_agent:
+            agent_name = addressed_agent["name"]
+            await sio.emit("agent_typing", {"typing": True}, room=room)
+            await sio.emit("system_message", {"text": f"📝 {agent_name} is preparing the meeting summary..."}, room=room)
+
+            summary = await agent_summarize_meeting(addressed_agent, int(meeting_id), messages)
+
+            await sio.emit("agent_typing", {"typing": False}, room=room)
+            await sio.emit("chat_update", {"sender": agent_name, "text": summary}, room=room)
+            _enqueue_tts(summary, agent_name, room, meeting_id)
+            _save_message_to_db(meeting_id, "agent", agent_name, summary)
+            sync_message_to_pinecone(meeting_id, agent_name, summary)
+
+            from langchain_core.messages import AIMessage as _AIMessage
+            state["messages"] = list(state.get("messages", [])) + [
+                _AIMessage(content=f"[{agent_name}]: {summary}")
+            ]
+            meeting_states[meeting_id] = state
+            _start_continuation(meeting_id, room)
+            return
+
     # Import here to avoid circular imports
     from utils.store import active_graphs, meeting_states, meeting_profiles
     print(f"Looking for key: '{meeting_id}' in keys: {list(active_graphs.keys())}")
@@ -403,6 +471,10 @@ async def user_message(sid, data):
                             response_text = content.split("]: ", 1)[1] if "]: " in content else content
                             await sio.emit("chat_update", {"sender": name, "text": response_text}, room=room)
                             _enqueue_tts(response_text, name, room, meeting_id)
+                            
+                            # Sync agent response to Vector DB
+                            sync_message_to_pinecone(meeting_id, name, response_text)
+                            _save_message_to_db(meeting_id, "agent", name, response_text)
                         except (IndexError, ValueError):
                             await sio.emit("chat_update", {"sender": "Agent", "text": content}, room=room)
                             _enqueue_tts(content, "Agent", room, meeting_id)
@@ -497,8 +569,8 @@ async def end_meeting(sid, data):
     
     # Mark meeting as ended in the database
     from database import engine
-    from models import Meeting
-    from sqlmodel import Session
+    from models import Meeting, Message
+    from sqlmodel import Session, select, delete
     from datetime import datetime, timezone
     
     try:
@@ -509,7 +581,15 @@ async def end_meeting(sid, data):
                 meeting.status = "ended"
                 meeting.ended_at = datetime.now(timezone.utc)
                 session.add(meeting)
+
+                # DELETE all messages for this meeting from SQL (they still live in Pinecone)
+                statement = select(Message).where(Message.meeting_id == meeting_int_id)
+                results = session.exec(statement)
+                for msg in results:
+                    session.delete(msg)
+
                 session.commit()
+                print(f"[Socket] Meeting {meeting_id} ended: SQL messages deleted.")
     except Exception as e:
         print(f"[Socket] Error ending meeting {meeting_id} in DB: {e}")
 

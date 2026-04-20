@@ -60,8 +60,21 @@ class Meeting(SQLModel, table=True):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     ended_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))  
     
+    summary: Optional[str] = None  # Store the agent-generated summary here
+    
     user: Optional[User] = Relationship(back_populates="meetings")
     agents: List["Agents"] = Relationship(back_populates="meetings", link_model=MeetingAgentLink)
+    messages: List["Message"] = Relationship(back_populates="meeting")
+
+class Message(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    meeting_id: int = Field(foreign_key="meeting.id", index=True)
+    sender_type: str = Field(index=True)  # "human" or "agent"
+    sender_name: str  # "You" or Agent Name
+    content: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    meeting: Optional[Meeting] = Relationship(back_populates="messages")
 
 class MeetingCreate(SQLModel):
     agentIds: List[int]

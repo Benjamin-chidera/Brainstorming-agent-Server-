@@ -7,6 +7,8 @@ from utils.auth import get_current_user
 from starlette import status
 from utils.agents import parse_agents, build_meeting_graph
 from utils.store import active_graphs, meeting_states, meeting_profiles
+from langchain_core.messages import HumanMessage, AIMessage
+from models import Message
 
 route = APIRouter(
     prefix="/agents",
@@ -32,15 +34,29 @@ def restore_meeting_memory(meeting: Meeting, user: User = None):
             elif meeting.user:
                 human_name = meeting.user.full_name or meeting.user.email.split("@")[0]
 
+            # Fetch history from DB to rehydrate memory
+            from database import engine
+            with Session(engine) as db_session:
+                db_messages = db_session.exec(
+                    select(Message).where(Message.meeting_id == meeting.id).order_by(Message.created_at)
+                ).all()
+            
+            langchain_msgs = []
+            for m in db_messages:
+                if m.sender_type == "human":
+                    langchain_msgs.append(HumanMessage(content=m.content))
+                else:
+                    langchain_msgs.append(AIMessage(content=f"[{m.sender_name}]: {m.content}"))
+
             meeting_states[meeting_id] = {
-                "messages": [],
+                "messages": langchain_msgs,
                 "meeting_id": meeting.id,
                 "current_speaker": "",
                 "participants": profiles,
                 "human_input": None,
                 "human_name": human_name,
                 "next_agents": [],
-                "agenda_set": False,
+                "agenda_set": len(langchain_msgs) > 0, # Assume agenda is set if there are messages
                 "waiting_for": None,
             }
     return meeting_id

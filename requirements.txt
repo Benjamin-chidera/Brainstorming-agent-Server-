@@ -16,6 +16,7 @@ langchain-openai
 openai
 python-socketio
 pytest
+langchain-pinecone
 # huggingface_hub
 # transformers
 # torch<2.3.0
