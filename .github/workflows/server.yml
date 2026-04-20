@@ -3,22 +3,13 @@ name: Council.ai server
 on:
   push:
     branches: [main]
-    paths:
-      - "Server/**"
-      - ".github/workflows/server.yml"
   pull_request:
     branches: [main]
-    paths:
-      - "Server/**"
-      - ".github/workflows/server.yml"
 
 jobs:
   ci:
     name: Test
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: Server
 
     steps:
       - name: Checkout
