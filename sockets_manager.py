@@ -639,3 +639,93 @@ async def unmute_agent(sid, data):
 
     _muted_agents.get(meeting_id, set()).discard(agent_id)
     print(f"[Socket] Agent {agent_id} unmuted in meeting {meeting_id} by {sid}")
+
+
+@sio.event
+async def summarize_meeting_request(sid, data):
+    """
+    Triggered when the user clicks "Summarize Meeting" on an agent's hover card.
+    Asks that specific agent to produce a meeting summary in their voice/persona.
+    Emits task_progress events so the frontend can show progress in the TaskTracker.
+    """
+    meeting_id = str(data.get("meeting_id", ""))
+    agent_id   = str(data.get("agent_id", ""))
+    task_id    = str(data.get("task_id", ""))
+    if not meeting_id or not agent_id:
+        return
+
+    from utils.store import meeting_states, meeting_profiles
+
+    profiles = meeting_profiles.get(meeting_id, [])
+    state    = meeting_states.get(meeting_id, {})
+    messages = state.get("messages", [])
+    room     = meeting_id
+
+    # Find the agent by id
+    agent_profile = next(
+        (p for p in profiles if str(p.get("id", "")) == agent_id),
+        None
+    )
+    if not agent_profile:
+        await sio.emit(
+            "system_message",
+            {"text": "Could not find that agent to summarize."},
+            room=room,
+        )
+        if task_id:
+            await sio.emit("task_progress", {
+                "task_id": task_id, "status": "completed", "progress": 100,
+                "result": "Error: agent not found."
+            }, room=room)
+        return
+
+    agent_name = agent_profile["name"]
+
+    # Pause autonomous loop while summarizing
+    _cancel_continuation(meeting_id)
+    _clear_tts_queue(meeting_id)
+
+    # ── Progress: 30% — Processing conversation ──
+    if task_id:
+        await sio.emit("task_progress", {
+            "task_id": task_id, "status": "in-progress", "progress": 30,
+        }, room=room)
+
+    await sio.emit("agent_typing", {"typing": True}, room=room)
+    await sio.emit(
+        "system_message",
+        {"text": f"📝 {agent_name} is preparing the meeting summary..."},
+        room=room,
+    )
+
+    # ── Progress: 60% — Generating summary with LLM ──
+    if task_id:
+        await sio.emit("task_progress", {
+            "task_id": task_id, "status": "in-progress", "progress": 60,
+        }, room=room)
+
+    summary = await agent_summarize_meeting(agent_profile, int(meeting_id), messages)
+
+    # ── Progress: 100% — Completed ──
+    if task_id:
+        await sio.emit("task_progress", {
+            "task_id": task_id, "status": "completed", "progress": 100,
+            "result": summary,
+        }, room=room)
+
+    await sio.emit("agent_typing", {"typing": False}, room=room)
+    await sio.emit("chat_update", {"sender": agent_name, "text": summary}, room=room)
+    _enqueue_tts(summary, agent_name, room, meeting_id)
+    _save_message_to_db(meeting_id, "agent", agent_name, summary)
+    sync_message_to_pinecone(meeting_id, agent_name, summary)
+
+    # Update meeting state with the summary message
+    from langchain_core.messages import AIMessage as _AIMessage
+    state["messages"] = list(state.get("messages", [])) + [
+        _AIMessage(content=f"[{agent_name}]: {summary}")
+    ]
+    meeting_states[meeting_id] = state
+
+    # Resume autonomous conversation
+    _start_continuation(meeting_id, room)
+    print(f"[Socket] Agent {agent_name} summarized meeting {meeting_id} for {sid}")
